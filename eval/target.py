@@ -6,6 +6,7 @@ import requests
 
 from config import (
     MAX_TOKENS,
+    MODAL_APP_NAME,
     MODAL_ENDPOINT_URL,
     MODE,
     TARGET_TEMPERATURE,
@@ -27,7 +28,7 @@ warnings.filterwarnings(
 
 def _call_sdk(messages, thinking_mode=False):
     import modal
-    cls = modal.Cls.from_name("test-llm-chatbot-thuky", "LLMServer")
+    cls = modal.Cls.from_name(MODAL_APP_NAME, "LLMServer")
     t0 = time.time()
     kwargs = dict(
         messages=messages,

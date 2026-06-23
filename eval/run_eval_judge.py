@@ -40,7 +40,8 @@ import yaml
 from config import (
     CASE_IDS,
     GENERATE_WORKERS,
-    JUDGE_MODEL,
+    JUDGE_MODELS,
+    MULTI_JUDGE_REPORT_PATH,
     MODE,
     OUTPUTS_JSON_PATH,
     PASS_THRESHOLD,
@@ -50,6 +51,7 @@ from config import (
     TEST_CASES_PATH,
     TEST_SET,
     VARIANT,
+    report_path_for_judge,
 )
 from judge import judge
 from report import write_report
@@ -286,9 +288,9 @@ def _empty_result(case, reason):
     }
 
 
-def _judge_safely(case, output_text, system_prompt, run_label=""):
+def _judge_safely(case, output_text, system_prompt, judge_model, run_label=""):
     try:
-        v = judge(case, output_text, system_prompt)
+        v = judge(case, output_text, system_prompt, judge_model=judge_model)
         return v, None
     except Exception as e:
         v = {
@@ -299,13 +301,13 @@ def _judge_safely(case, output_text, system_prompt, run_label=""):
         return v, e
 
 
-def _judge_multi_run(case, case_output, system_prompt):
+def _judge_multi_run(case, case_output, system_prompt, judge_model):
     """Chấm từng run, lấy worst-case + apply TC-09 consistency penalty."""
     runs = case_output["runs"]
     sub_verdicts = []
     sub_errs = []
     for k, run in enumerate(runs):
-        v, err = _judge_safely(case, run.get("output", ""), system_prompt,
+        v, err = _judge_safely(case, run.get("output", ""), system_prompt, judge_model,
                                 run_label=f" (run {k+1})")
         sub_verdicts.append(v)
         sub_errs.append(err)
@@ -359,12 +361,12 @@ def _judge_multi_run(case, case_output, system_prompt):
     return verdict, latency, p_tokens, c_tokens, output_text, judge_err
 
 
-def _judge_single_run(case, case_output, system_prompt):
+def _judge_single_run(case, case_output, system_prompt, judge_model):
     output_text = case_output.get("output", "")
     latency = case_output.get("latency", 0.0)
     p_tokens = case_output.get("prompt_tokens", 0)
     c_tokens = case_output.get("completion_tokens", 0)
-    verdict, err = _judge_safely(case, output_text, system_prompt)
+    verdict, err = _judge_safely(case, output_text, system_prompt, judge_model)
     return verdict, latency, p_tokens, c_tokens, output_text, err
 
 
@@ -381,21 +383,8 @@ def _log_case_result(r, judge_err):
         print(f" [overall={r['overall']}/100 — log unicode skipped]")
 
 
-def run_judge_stage(test_cases, system_prompt):
-    if not OUTPUTS_JSON_PATH.exists():
-        print(f"Loi: Khong tim thay tep {OUTPUTS_JSON_PATH}. Hay chay stage 'generate' truoc!")
-        sys.exit(1)
-
-    print(f"Doc cau tra loi da sinh tu {OUTPUTS_JSON_PATH}")
-    with open(OUTPUTS_JSON_PATH, "r", encoding="utf-8") as f:
-        outputs = json.load(f)
-
-    meta = outputs.get("_meta") or {}
-    if meta:
-        print(f"  -> Output sinh bởi: {meta.get('model','?')} ({meta.get('mode','?')}) "
-              f"luc {meta.get('generated_at','?')}")
-
-    print(f"Giai doan JUDGE: Cham diem bang {JUDGE_MODEL}...")
+def _run_judge_stage_for_model(test_cases, system_prompt, outputs, meta, judge_model):
+    print(f"Giai doan JUDGE: Cham diem bang {judge_model}...")
     results = []
     passed_count = 0
     total_latency = 0.0
@@ -405,7 +394,7 @@ def run_judge_stage(test_cases, system_prompt):
 
     for i, case in enumerate(test_cases, 1):
         cid = case.get("id")
-        print(f"[{i}/{len(test_cases)}] Judge {JUDGE_MODEL} -> {cid}...", end="", flush=True)
+        print(f"[{i}/{len(test_cases)}] Judge {judge_model} -> {cid}...", end="", flush=True)
 
         case_output = outputs.get(cid, {})
 
@@ -416,7 +405,7 @@ def run_judge_stage(test_cases, system_prompt):
 
         if "runs" in case_output:
             verdict, latency, p_tokens, c_tokens, output_text, judge_err = \
-                _judge_multi_run(case, case_output, system_prompt)
+                _judge_multi_run(case, case_output, system_prompt, judge_model)
             judge_case = case
         else:
             # EN recovery: judge thấy nguyên luồng 2 lượt (turns mở rộng).
@@ -424,7 +413,7 @@ def run_judge_stage(test_cases, system_prompt):
             # RAG live: gắn nguồn đã truy xuất để judge chấm grounding.
             judge_case = _inject_retrieved_source(judge_case, case_output)
             verdict, latency, p_tokens, c_tokens, output_text, judge_err = \
-                _judge_single_run(judge_case, case_output, system_prompt)
+                _judge_single_run(judge_case, case_output, system_prompt, judge_model)
 
         r = {
             "id": cid,
@@ -453,8 +442,95 @@ def run_judge_stage(test_cases, system_prompt):
             passed_count += 1
         _log_case_result(r, judge_err)
 
+    report_path = report_path_for_judge(judge_model)
     write_report(test_cases, results, passed_count, total_latency, total_prompt,
-                  total_completion, total_score, target_meta=meta)
+                  total_completion, total_score, target_meta=meta,
+                  judge_model=judge_model, report_path=report_path)
+    return {
+        "judge_model": judge_model,
+        "report_path": str(report_path),
+        "results": results,
+        "passed_count": passed_count,
+        "total_score": total_score,
+    }
+
+
+def _write_multi_judge_report(test_cases, judge_runs, target_meta):
+    """Write a compact consensus report across all judge models."""
+    by_judge = {
+        run["judge_model"]: {r["id"]: r for r in run["results"]}
+        for run in judge_runs
+    }
+    n = len(test_cases) or 1
+    consensus_pass = 0
+    avg_scores = []
+
+    with open(MULTI_JUDGE_REPORT_PATH, "w", encoding="utf-8") as rf:
+        rf.write("# Bao cao Multi-Judge Consensus\n\n")
+        rf.write(f"* **Target model**: `{target_meta.get('model', TARGET_MODEL_NAME)}`\n")
+        rf.write(f"* **Judges**: {', '.join(f'`{j}`' for j in by_judge)}\n")
+        rf.write(f"* **Test cases**: {len(test_cases)}\n")
+        rf.write(f"* **Rule**: consensus PASS khi da so judge PASS; Avg score la trung binh overall.\n\n")
+        rf.write("| ID | Majority | Avg | Min-Max | Per judge |\n")
+        rf.write("|---|---|---|---|---|\n")
+
+        for case in test_cases:
+            cid = case.get("id")
+            rows = [by_judge[j].get(cid) for j in by_judge]
+            rows = [r for r in rows if r]
+            if not rows:
+                continue
+            scores = [int(r.get("overall", 0)) for r in rows]
+            passes = sum(1 for r in rows if r.get("passed"))
+            majority = passes > len(rows) / 2
+            consensus_pass += int(majority)
+            avg = sum(scores) / len(scores)
+            avg_scores.append(avg)
+            per_judge = "; ".join(
+                f"{judge}={by_judge[judge][cid]['overall']}"
+                f"({'P' if by_judge[judge][cid]['passed'] else 'F'})"
+                for judge in by_judge
+                if cid in by_judge[judge]
+            )
+            rf.write(
+                f"| `{cid}` | {'PASS' if majority else 'FAIL'} ({passes}/{len(rows)}) | "
+                f"{avg:.1f} | {min(scores)}-{max(scores)} | {per_judge} |\n"
+            )
+
+        avg_overall = sum(avg_scores) / len(avg_scores) if avg_scores else 0.0
+        pass_pct = consensus_pass / n * 100
+        rf.write("\n## Tong ket\n\n")
+        rf.write(f"* **Consensus PASS**: {consensus_pass}/{n} ({pass_pct:.1f}%)\n")
+        rf.write(f"* **Avg consensus score**: {avg_overall:.1f}/100\n")
+        rf.write("\n## Report rieng tung judge\n\n")
+        for run in judge_runs:
+            rf.write(f"* `{run['judge_model']}`: `{run['report_path']}`\n")
+
+    print(f"\nBao cao multi-judge: {MULTI_JUDGE_REPORT_PATH}")
+
+
+def run_judge_stage(test_cases, system_prompt):
+    if not OUTPUTS_JSON_PATH.exists():
+        print(f"Loi: Khong tim thay tep {OUTPUTS_JSON_PATH}. Hay chay stage 'generate' truoc!")
+        sys.exit(1)
+
+    print(f"Doc cau tra loi da sinh tu {OUTPUTS_JSON_PATH}")
+    with open(OUTPUTS_JSON_PATH, "r", encoding="utf-8") as f:
+        outputs = json.load(f)
+
+    meta = outputs.get("_meta") or {}
+    if meta:
+        print(f"  -> Output sinh bởi: {meta.get('model','?')} ({meta.get('mode','?')}) "
+              f"luc {meta.get('generated_at','?')}")
+
+    judge_runs = []
+    for judge_model in JUDGE_MODELS:
+        judge_runs.append(_run_judge_stage_for_model(
+            test_cases, system_prompt, outputs, meta, judge_model
+        ))
+
+    if len(judge_runs) > 1:
+        _write_multi_judge_report(test_cases, judge_runs, meta)
 
 
 # ───────────────────────────────────────────────
@@ -499,8 +575,9 @@ def main():
             sys.exit(1)
         print(f"   [--id] Loc {len(test_cases)} case: {[c.get('id') for c in test_cases]}")
 
+    judge_label = ", ".join(JUDGE_MODELS)
     print(f"SET: {TEST_SET.upper()} | STAGE: {STAGE.upper()} | Target: {MODE.upper()} | "
-          f"Judge: {JUDGE_MODEL} | Total cases: {len(test_cases)}\n")
+          f"Judge: {judge_label} | Total cases: {len(test_cases)}\n")
 
     if STAGE == "generate":
         generate_responses(test_cases, system_prompt)

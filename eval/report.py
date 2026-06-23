@@ -55,7 +55,8 @@ def _per_tc_short(per_tc):
 
 
 def _print_console_summary(n, passed_count, production_count, avg_overall, avg_latency,
-                            total_prompt, total_completion, target_meta, per_tc):
+                            total_prompt, total_completion, target_meta, per_tc,
+                            judge_model=None):
     pass_pct = passed_count / n * 100
     production_pct = production_count / n * 100
     print("\n" + "=" * 60)
@@ -71,7 +72,7 @@ def _print_console_summary(n, passed_count, production_count, avg_overall, avg_l
     print(f"Completion tokens  : {total_completion}")
     print(f"Target model       : {target_meta.get('model', TARGET_MODEL_NAME)} "
           f"(Modal {target_meta.get('mode', MODE).upper()})")
-    print(f"Judge model        : {JUDGE_MODEL}")
+    print(f"Judge model        : {judge_model or JUDGE_MODEL}")
     print("-" * 60)
     print("Diem TB theo tieu chi (xlsx v3, thang 0-100):")
     for tc, s in per_tc.items():
@@ -80,7 +81,7 @@ def _print_console_summary(n, passed_count, production_count, avg_overall, avg_l
 
 
 def _write_header(rf, n, passed_count, production_count, avg_overall, avg_latency,
-                   total_prompt, total_completion, target_meta):
+                   total_prompt, total_completion, target_meta, judge_model=None):
     pass_pct = passed_count / n * 100
     production_pct = production_count / n * 100
     target_model = target_meta.get("model", TARGET_MODEL_NAME)
@@ -90,7 +91,7 @@ def _write_header(rf, n, passed_count, production_count, avg_overall, avg_latenc
     rf.write("# Bao cao Danh gia LLM-as-Judge\n\n")
     rf.write(f"* **Thoi gian**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     rf.write(f"* **Target model**: `{target_model}` (Modal {target_mode_str}, generated {gen_at})\n")
-    rf.write(f"* **Judge model**: `{JUDGE_MODEL}`\n")
+    rf.write(f"* **Judge model**: `{judge_model or JUDGE_MODEL}`\n")
     rf.write(f"* **Nguon tieu chi**: `Chatbot_ThuKy_UseCases_EvalCriteria_v3.xlsx` (sheet 'Tieu chi danh gia')\n")
     rf.write(f"* **Thang diem**: 0-100 (PASS >= {PASS_THRESHOLD}, Production-ready >= {PRODUCTION_THRESHOLD})\n")
     rf.write(f"* **Test cases**: {n}\n")
@@ -191,7 +192,8 @@ def _write_all_responses(rf, results):
 
 
 def write_report(test_cases, results, passed_count, total_latency, total_prompt,
-                  total_completion, total_score, target_meta=None):
+                  total_completion, total_score, target_meta=None,
+                  judge_model=None, report_path=None):
     n = len(test_cases) or 1
     avg_latency = total_latency / n
     avg_overall = total_score / n
@@ -200,14 +202,16 @@ def write_report(test_cases, results, passed_count, total_latency, total_prompt,
     per_tc = _compute_per_tc_scores(results)
 
     _print_console_summary(n, passed_count, production_count, avg_overall, avg_latency,
-                            total_prompt, total_completion, target_meta, per_tc)
+                            total_prompt, total_completion, target_meta, per_tc,
+                            judge_model=judge_model)
 
-    with open(REPORT_PATH, "w", encoding="utf-8") as rf:
+    report_path = report_path or REPORT_PATH
+    with open(report_path, "w", encoding="utf-8") as rf:
         _write_header(rf, n, passed_count, production_count, avg_overall, avg_latency,
-                       total_prompt, total_completion, target_meta)
+                       total_prompt, total_completion, target_meta, judge_model=judge_model)
         _write_per_tc_table(rf, per_tc)
         _write_summary_table(rf, results)
         _write_fail_details(rf, results)
         _write_all_responses(rf, results)
 
-    print(f"\nBao cao: {REPORT_PATH}")
+    print(f"\nBao cao: {report_path}")

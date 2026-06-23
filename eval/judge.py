@@ -1,4 +1,4 @@
-"""LLM-as-Judge: build prompt, call Gemini/DashScope, sanitize verdict.
+"""LLM-as-Judge: build prompt, call Gemini/DeepSeek/OpenRouter, sanitize verdict.
 
 Public API:
   judge(case, output_text, system_prompt="") → dict
@@ -15,12 +15,19 @@ from google.genai import types
 from openai import OpenAI
 
 from config import (
-    DASHSCOPE_API_KEY,
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_BASE_URL,
+    DEEPSEEK_REASONING_EFFORT,
+    DEEPSEEK_THINKING_ENABLED,
     GEMINI_API_KEY,
     JUDGE_MODEL,
     JUDGE_RPM,
     JUDGE_SEED,
     JUDGE_TEMPERATURE,
+    OPENROUTER_API_KEY,
+    OPENROUTER_APP_NAME,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_SITE_URL,
     PASS_THRESHOLD,
 )
 from criteria import JUDGE_SCHEMA, JUDGE_SYSTEM, JUDGE_SYSTEM_RAG
@@ -39,17 +46,33 @@ if GEMINI_API_KEY:
     except Exception as e:
         print(f"⚠️ Không thể khởi tạo Gemini client: {e}")
 
-# DashScope client chỉ dùng cho judge khi JUDGE_MODEL bắt đầu bằng "qwen"
-# (generate stage không còn gọi DashScope).
-_dashscope_client = None
-if DASHSCOPE_API_KEY:
+# DeepSeek client: OpenAI-compatible API (base_url=https://api.deepseek.com).
+_deepseek_client = None
+if DEEPSEEK_API_KEY:
     try:
-        _dashscope_client = OpenAI(
-            api_key=DASHSCOPE_API_KEY,
-            base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        _deepseek_client = OpenAI(
+            api_key=DEEPSEEK_API_KEY,
+            base_url=DEEPSEEK_BASE_URL,
         )
     except Exception as e:
-        print(f"⚠️ Không thể khởi tạo DashScope client: {e}")
+        print(f"⚠️ Không thể khởi tạo DeepSeek client: {e}")
+
+# OpenRouter client: OpenAI-compatible API for slugs like "qwen/qwen3.6-flash".
+_openrouter_client = None
+if OPENROUTER_API_KEY:
+    try:
+        headers = {}
+        if OPENROUTER_SITE_URL:
+            headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+        if OPENROUTER_APP_NAME:
+            headers["X-Title"] = OPENROUTER_APP_NAME
+        _openrouter_client = OpenAI(
+            api_key=OPENROUTER_API_KEY,
+            base_url=OPENROUTER_BASE_URL,
+            default_headers=headers or None,
+        )
+    except Exception as e:
+        print(f"⚠️ Không thể khởi tạo OpenRouter client: {e}")
 
 
 # ───────────────────────────────────────────────
@@ -234,7 +257,8 @@ def build_judge_prompt_rag(case, output_text, system_prompt="", source_text=None
 # ───────────────────────────────────────────────
 # Judge API callers
 # ───────────────────────────────────────────────
-def _call_gemini(prompt: str, system: str = JUDGE_SYSTEM, file_path=None) -> dict:
+def _call_gemini(prompt: str, system: str = JUDGE_SYSTEM, file_path=None,
+                 judge_model: str = JUDGE_MODEL) -> dict:
     if not _gemini_client:
         raise ValueError("Thiếu GEMINI_API_KEY trong .env để chạy Gemini judge.")
     contents = [prompt]
@@ -251,7 +275,7 @@ def _call_gemini(prompt: str, system: str = JUDGE_SYSTEM, file_path=None) -> dic
             except Exception:
                 pass
     resp = _gemini_client.models.generate_content(
-        model=JUDGE_MODEL,
+        model=judge_model,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=system,
@@ -264,11 +288,38 @@ def _call_gemini(prompt: str, system: str = JUDGE_SYSTEM, file_path=None) -> dic
     return json.loads(resp.text)
 
 
-def _call_dashscope(prompt: str, system: str = JUDGE_SYSTEM) -> dict:
-    if not _dashscope_client:
-        raise ValueError("Thiếu DASHSCOPE_API_KEY trong .env để chạy DashScope judge.")
-    completion = _dashscope_client.chat.completions.create(
-        model=JUDGE_MODEL,
+def _call_deepseek(prompt: str, system: str = JUDGE_SYSTEM,
+                   judge_model: str = JUDGE_MODEL) -> dict:
+    if not _deepseek_client:
+        raise ValueError("Thiếu DEEPSEEK_API_KEY trong .env để chạy DeepSeek judge.")
+
+    kwargs = {
+        "model": judge_model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": JUDGE_TEMPERATURE,
+        "stream": False,
+        "response_format": {"type": "json_object"},
+    }
+    if DEEPSEEK_REASONING_EFFORT:
+        kwargs["reasoning_effort"] = DEEPSEEK_REASONING_EFFORT
+    if DEEPSEEK_THINKING_ENABLED:
+        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+
+    completion = _deepseek_client.chat.completions.create(**kwargs)
+    content = completion.choices[0].message.content or "{}"
+    return json.loads(content)
+
+
+def _call_openrouter(prompt: str, system: str = JUDGE_SYSTEM,
+                     judge_model: str = JUDGE_MODEL) -> dict:
+    if not _openrouter_client:
+        raise ValueError("Thiếu OPENROUTER_API_KEY trong .env để chạy OpenRouter judge.")
+
+    completion = _openrouter_client.chat.completions.create(
+        model=judge_model,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
@@ -276,23 +327,10 @@ def _call_dashscope(prompt: str, system: str = JUDGE_SYSTEM) -> dict:
         temperature=JUDGE_TEMPERATURE,
         seed=JUDGE_SEED,
         response_format={"type": "json_object"},
-        stream=True,
+        stream=False,
     )
-    reasoning_chunks = []
-    content_chunks = []
-    for chunk in completion:
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        if hasattr(delta, "reasoning_content") and delta.reasoning_content is not None:
-            reasoning_chunks.append(delta.reasoning_content)
-        if hasattr(delta, "content") and delta.content is not None:
-            content_chunks.append(delta.content)
-    data = json.loads("".join(content_chunks))
-    reasoning = "".join(reasoning_chunks)
-    if reasoning:
-        data["judge_thinking"] = reasoning
-    return data
+    content = completion.choices[0].message.content or "{}"
+    return json.loads(content)
 
 
 # ───────────────────────────────────────────────
@@ -396,8 +434,10 @@ def _sanitize_verdict(data: dict, case: dict) -> dict:
 # ───────────────────────────────────────────────
 # Top-level judge entrypoint
 # ───────────────────────────────────────────────
-def judge(case, output_text, system_prompt="", retries=2):
-    is_qwen = JUDGE_MODEL.startswith("qwen")
+def judge(case, output_text, system_prompt="", retries=2, judge_model: str | None = None):
+    judge_model = judge_model or JUDGE_MODEL
+    is_openrouter = "/" in judge_model
+    is_deepseek = judge_model.startswith("deepseek")
     # Bản RAG: case có data truy xuất (type rag_with_data) hoặc khai báo rag_source.
     is_rag = case.get("type") == "rag_with_data" or bool(case.get("rag_source"))
 
@@ -406,8 +446,8 @@ def judge(case, output_text, system_prompt="", retries=2):
         kind, src = _resolve_rag_source(case)
         source_text = src if kind == "text" else None
         if kind == "file":
-            if is_qwen:
-                # DashScope/Qwen không upload file được → đọc text nhúng vào prompt.
+            if is_deepseek or is_openrouter:
+                # Non-Gemini providers here do not use Gemini Files API → đọc text nhúng vào prompt.
                 try:
                     source_text = Path(src).read_text(encoding="utf-8")
                 except Exception:
@@ -428,8 +468,9 @@ def judge(case, output_text, system_prompt="", retries=2):
         try:
             _rate_limit_wait()
             data = (
-                _call_dashscope(prompt, judge_system) if is_qwen
-                else _call_gemini(prompt, judge_system, file_path)
+                _call_openrouter(prompt, judge_system, judge_model) if is_openrouter
+                else _call_deepseek(prompt, judge_system, judge_model) if is_deepseek
+                else _call_gemini(prompt, judge_system, file_path, judge_model)
             )
             data = _apply_must_not_contain_override(data, output_text, case)
             return _sanitize_verdict(data, case)
